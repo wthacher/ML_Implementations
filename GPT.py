@@ -21,11 +21,12 @@ SAVE_PATH = "./TinyStories_tokenized"
 D_HIDDEN = 256
 N_HEADS = 8
 N_LAYERS = 4
-MAX_LENGTH = 512
+MAX_LENGTH = 128
 NUM_PROC = 8
 # 1b. Load the tokenizer
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-VOCAB_SIZE = len(tokenizer)
+VOCAB_SIZE = 10000
+print(f"Vocab size: {VOCAB_SIZE}")
 # GPT2 doesn't have a pad token by default, so we add one
 tokenizer.pad_token = tokenizer.eos_token
 
@@ -126,6 +127,8 @@ class GPT_model(nn.Module):
         self.transformer_blocks = nn.ModuleList([TransformerBlock(d_hidden, n_heads, d_hidden) for _ in range(n_layers)])
         self.projection_layer = nn.Linear(d_hidden, d_vocab)
 
+        #implement weight tying by just transposing the embedding layer weights
+
     def forward(self, x: torch.Tensor):
         seq_len = x.size(1)
         idx = torch.arange(0, seq_len, device=x.device).unsqueeze(0)
@@ -139,8 +142,6 @@ class GPT_model(nn.Module):
         
         logits = self.projection_layer(x)
         return logits
-
-
 
 
 ## 3: Training loop 
@@ -157,8 +158,8 @@ import time
 def train_func():
     config={}
     config["lr"]=1e-4
-    config["batch_size"]=32
-    config["num_epochs"]=3
+    config["batch_size"]=64
+    config["num_epochs"]=10
 
 
     use_ray = False
@@ -195,7 +196,7 @@ def train_func():
     
     print("Loading data into memory.")
     start_time = time.time()
-    subset_size = 500 # Use a small number for testing
+    subset_size = 50000 # Use a small number for testing
     test_subset = tokenized_dataset["train"].select(range(subset_size))
 
     # Convert to int32 (fastest for MPS) and move to device ONCE
@@ -222,10 +223,12 @@ def train_func():
         
         ##add timers to see what is slowing down the training  
         start_time = time.time()
+        time_loop = False
 
         for i in range(0, num_samples, batch_size):
-            torch.mps.synchronize()
-            t0 = time.time()
+            if time_loop:
+                torch.mps.synchronize()
+                t0 = time.time()
             # Grab a batch of indices
             batch_indices = indices[i : i + batch_size]
             
@@ -235,34 +238,38 @@ def train_func():
             b_mask = all_masks[batch_indices]
             
             seq_in = b_ids[:, :-1]
-            mask_row = b_mask[:, :-1]
             targets = b_ids[:, 1:]
-            torch.mps.synchronize()
-            print(f"Time taken to load batch: {time.time() - t0} seconds")
+            
+            if time_loop:
+                torch.mps.synchronize()
+                print(f"Time taken to load batch: {time.time() - t0} seconds")
+                t0 = time.time()
 
-            # padding_mask = mask_row.unsqueeze(1).expand(-1, mask_row.size(1), -1)
-
-            # # 3. (Optional but recommended) Combine with Causal Mask
-            # # If your model doesn't handle the causal (triangular) mask internally:
-            # causal_mask = torch.tril(torch.ones(mask_row.size(1), mask_row.size(1), device=device)).bool()
-            # combined_mask = padding_mask & causal_mask
-            t0 = time.time()
             logits = model(seq_in) ##model outputs next token logits
-            torch.mps.synchronize()
-            print(f"Forward time: {time.time() - t0} seconds")
-            loss = loss_fn(logits.reshape(-1, logits.size(-1)), targets.reshape(-1)) ##flatten for speed here
-            torch.mps.synchronize()
-            print(f"Loss time: {time.time() - t0} seconds")
+            if time_loop:
+                torch.mps.synchronize()
+                print(f"Forward time: {time.time() - t0} seconds")
+                t0 = time.time()
+            loss = loss_fn(logits.reshape(-1, logits.size(-1)).contiguous(), targets.reshape(-1).contiguous()) ##flatten for speed here
+            
+            if time_loop:
+                torch.mps.synchronize()
+                print(f"Loss time: {time.time() - t0} seconds")
+                t0 = time.time()
             loss.backward()
-            torch.mps.synchronize()
-            print(f"Backward time: {time.time() - t0} seconds")
+            
+            if time_loop:
+                torch.mps.synchronize()
+                print(f"Backward time: {time.time() - t0} seconds")
+                t0 = time.time()
+            
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
         
         
         end_time = time.time()       
-        #print(f"Epoch {epoch} loss: {loss.item()}")
+        print(f"Epoch {epoch} loss: {loss.item()}")
         print(f"Time taken for epoch {epoch}: {end_time - start_time} seconds")
         
         if use_ray:
@@ -287,7 +294,7 @@ def train_func():
         print("Model saved to ray checkpoint")
     return 
 
-train_func()
+# train_func()
 # import matplotlib.pyplot as plt
 # plt.plot(loss_history)
 # plt.show()
@@ -306,16 +313,22 @@ model = GPT_model(d_vocab= VOCAB_SIZE, d_hidden=D_HIDDEN, n_heads=N_HEADS, n_lay
 model.load_state_dict(torch.load("gpt_model.pt"))
 model.to(device)
 
-def sample_text(model, tokenizer, max_length=20):
+def sample_text(model, tokenizer, max_length=100):
     model.eval()
-    tokens = tokenizer.encode("asdfadsf")
+    tokens = tokenizer.encode("Tell me a story about a dog.")
     
     tokens = torch.tensor(tokens).unsqueeze(0).to(device)
 
     for _ in range(max_length):
         logits = model(tokens)
-        next_token = torch.argmax(logits[0, -1, :]) ##argmax sampler
+        ##sample from multinomial distribution
+        probs = torch.softmax(logits[0, -1, :], dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        #next_token = torch.argmax(logits[0, -1, :]) ##argmax sampler
         tokens = torch.cat([tokens, next_token.reshape(1,1)], dim=1)
     return tokenizer.decode(tokens[0].tolist())
 
 print(sample_text(model, tokenizer))
+
+
+##Next you need to write some evaluation functions
